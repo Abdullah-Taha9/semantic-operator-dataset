@@ -225,3 +225,7 @@ datasets/
 # Local implementation instructions (not repository deliverables)
 AGENTS.md
 GROUND_TRUTH_LABELING_PLAN.md
+requirements.backup.txt
+uv.lock
+runs/
+slurm_logs/

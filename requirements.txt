@@ -1,8 +1,0 @@
-# Always required
-pyarrow
-huggingface_hub
-python-dotenv
-litellm
-
-# Optional local backend (install separately):
-# vllm
