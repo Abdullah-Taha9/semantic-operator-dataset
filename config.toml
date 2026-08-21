@@ -1,0 +1,40 @@
+[shared]
+manifest = "queries.jsonl"
+dataset = "datasets/amazon_products.parquet"
+
+[label]
+backend = "api"
+model = "gpt-5.5"
+system_prompt = "Respond with exactly True or False and no other text."
+queries = []
+concurrency = 16                 # API backend only; vLLM schedules its own batch.
+api_checkpoint_every = 500      # Responses per atomic API fragment.
+vllm_checkpoint_every = 5000    # Prompts per vLLM chat call and atomic fragment.
+attempts = 3
+retry_delay_seconds = 5.0
+enable_cache = true
+
+# No generation parameter is set unless it is uncommented here.
+[label.api_parameters]
+# max_tokens = 10
+# temperature = 0.0
+# top_p = 1.0
+# seed = 42
+
+# No generation parameter is set unless it is uncommented here.
+[label.vllm_parameters]
+# max_tokens = 10
+# temperature = 0.0
+# top_p = 1.0
+# seed = 42
+
+# Arguments in this table are passed to vllm.LLM when the engine is created.
+# Set this manually to the fewest GPUs needed to fit the model. vLLM does not
+# automatically select the minimum GPU count, and omitted arguments use its defaults.
+[label.vllm_engine_parameters]
+tensor_parallel_size = 2
+
+[publish]
+repo_id = "your-org/amazon-products-ground-truth"
+card_template = "card_template.md"
+queries = []

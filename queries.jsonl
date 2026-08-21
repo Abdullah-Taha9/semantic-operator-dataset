@@ -1,0 +1,1 @@
+{"id": 1, "filter": "Is this product description about electronics? Product title: {title}\nProduct description: {description}", "system_prompt": "Respond with exactly True or False and no other text."}
