@@ -8,22 +8,21 @@ merged data, and publish staging files are written elsewhere.
 
 ## Installation
 
-Install the base dependencies:
+Install the pinned project dependencies:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
-The default API backend is included. Install vLLM only for local inference:
+Or install them directly from `pyproject.toml`:
 
 ```bash
-# Optional local batched inference
-pip install vllm
+pip install .
 ```
 
-Both scripts load a local `.env` file. For the API backend, set the provider credentials
-required by the LiteLLM model string. Publishing uses `HF_TOKEN`. `.env.example` shows
-the default OpenAI case.
+Both scripts load a local `.env` file. For the API backend, set the credentials required
+by the LiteLLM model string. Publishing uses `HF_TOKEN`. For vLLM model downloads,
+Hugging Face also reads `HF_TOKEN` and honors `HF_HOME` when it is set.
 
 ## Configuration
 
@@ -45,9 +44,11 @@ python publish.py --config config-reviews.toml
 
 An empty `queries` list means all available queries.
 
-Generation parameters are also configured in TOML. Every key is optional: empty tables
-pass no generation parameters and therefore use backend/model defaults. Uncommented
-values are passed directly and included in the query fingerprint.
+Generation parameters are also configured in TOML. Every key is optional and only
+uncommented values are passed directly. One deliberate vLLM exception is recorded in
+the effective fingerprint: when `max_tokens` is omitted, the labeler passes
+`max_tokens=None` to avoid vLLM 0.25.1's 16-token output default. Generation is then
+bounded by the engine's `max_model_len`, which covers input plus output.
 
 For local inference, `[label.vllm_engine_parameters]` is passed directly to `vllm.LLM`.
 Set `tensor_parallel_size` manually to the fewest GPUs required to fit the model; vLLM
@@ -61,13 +62,16 @@ Use one JSONL manifest per base dataset. The base dataset belongs in `config.tom
 query requires only `id` and `filter`:
 
 ```json
-{"id": 1, "filter": "The review mentions shipping trouble: {review_text}"}
+{"id": 1, "type": "Simple Base-Table Predicate", "category": ["equality"], "filter": "The review mentions shipping trouble: {review_text}"}
 ```
 
 `system_prompt` is optional per query. When absent, `[label].system_prompt` from TOML is
 used. When present, the query value overrides that default. Other JSON fields are
-ignored. All alignment and merging are permanently based on the base file's zero-based
-row order.
+ignored by labeling. The optional reporting-only fields `type` and `category` are shown
+in the published dataset card; `category`, when present, is a list of strings. Adding,
+removing, or changing either field does not affect prompts, fingerprints, caching,
+resume behavior, labels, or merged Parquet columns. All alignment and merging are
+permanently based on the base file's zero-based row order.
 
 Templates use Python `str.format` fields. Only referenced Parquet columns are loaded.
 A rendering error aborts the run.
@@ -107,8 +111,12 @@ Re-running automatically skips positions already present in fragments. With cach
 enabled, successful responses in an interrupted checkpoint are also reused. Once a
 fragment is committed, its response-cache entries are removed.
 
-Only an existing model response that is not exactly `True` or `False` becomes a null
-label. Rendering, model-call, output-count, storage, and schema failures abort the run.
+The parser ignores any surrounding reasoning and selects the last complete
+`<answer>...</answer>` block. After trimming and case-folding its contents, `true`, `1`,
+and `yes` map to true; `false`, `0`, and `no` map to false. A missing or invalid final
+tag becomes a null label. A response whose finish reason is `length` also becomes null,
+even if an earlier complete answer tag exists. Rendering, missing-response,
+model-call, output-count, storage, and schema failures abort the run.
 
 API concurrency applies only to independent LiteLLM requests. The vLLM backend instead
 passes up to `vllm_checkpoint_every` prompts to one synchronous `LLM.chat()` call, and

@@ -229,3 +229,4 @@ requirements.backup.txt
 uv.lock
 runs/
 slurm_logs/
+queries

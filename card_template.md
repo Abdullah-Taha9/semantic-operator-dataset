@@ -32,9 +32,10 @@ Null values mean the model returned a response that could not be parsed as exact
 
 ## Dataset Creation
 
-Labels were generated with `ground-truth-labeler`. The per-query table above is rendered
-from the labeling manifest, which records the model, prompt, generation date,
-configuration fingerprint, and base-dataset identity.
+Labels were generated with `ground-truth-labeler`. The per-query table above combines
+reporting-only type/category notation from the query JSONL with the labeling manifest,
+which records the model, prompt, generation date, configuration fingerprint, and
+base-dataset identity.
 
 The labels are silver-standard model judgments and may contain errors or biases. Review
 their suitability before using them as evaluation targets.

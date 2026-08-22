@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -14,7 +15,7 @@ from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
-from typing import Callable
+from typing import Callable, TypeVar
 from uuid import uuid4
 
 import pyarrow as pa
@@ -25,6 +26,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _VLLM_ENGINE = None
+_ANSWER_PATTERN = re.compile(r"<answer>([^<>]*?)</answer>", re.IGNORECASE | re.DOTALL)
+_TRUE_ANSWERS = frozenset({"true", "1", "yes"})
+_FALSE_ANSWERS = frozenset({"false", "0", "no"})
+_T = TypeVar("_T")
+Response = tuple[str, str | None]
 
 
 def utc_now() -> str:
@@ -118,6 +124,7 @@ def query_config(
         "model": model,
         "filter": query["filter"],
         "system_prompt": query["system_prompt"],
+        "output_protocol": "last-answer-tag-v1",
         "generation_parameters": generation_parameters,
         "engine_parameters": engine_parameters,
         "dataset": identity,
@@ -125,7 +132,17 @@ def query_config(
 
 
 def config_fingerprint(config: dict) -> str:
-    encoded = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    fingerprinted_config = dict(config)
+    engine_parameters = dict(fingerprinted_config.get("engine_parameters", {}))
+    engine_parameters.pop("tensor_parallel_size", None)
+    engine_parameters.pop("max_model_len", None)
+    fingerprinted_config["engine_parameters"] = engine_parameters
+    encoded = json.dumps(
+        fingerprinted_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -200,10 +217,13 @@ def write_fragment_atomic(output_dir: Path, rows: list[dict]) -> Path:
 
 
 def parse_bool(response: str) -> bool | None:
-    normalized = response.strip().lower()
-    if normalized == "true":
+    matches = list(_ANSWER_PATTERN.finditer(response))
+    if not matches:
+        return None
+    normalized = matches[-1].group(1).strip().casefold()
+    if normalized in _TRUE_ANSWERS:
         return True
-    if normalized == "false":
+    if normalized in _FALSE_ANSWERS:
         return False
     return None
 
@@ -224,7 +244,7 @@ def render_rows(query: dict, columns: dict[str, list], positions: list[int]) -> 
     return rendered
 
 
-def retry(call: Callable[[], str], attempts: int, delay_seconds: float) -> str:
+def retry(call: Callable[[], _T], attempts: int, delay_seconds: float) -> _T:
     for attempt in range(1, attempts + 1):
         try:
             return call()
@@ -246,12 +266,12 @@ def call_api_batch(
     attempts: int,
     delay_seconds: float,
     generation_parameters: dict,
-    on_response: Callable[[int, str], None],
-) -> dict[int, str]:
+    on_response: Callable[[int, str, str | None], None],
+) -> dict[int, Response]:
     import litellm
 
-    def one(row: dict) -> str:
-        def invoke() -> str:
+    def one(row: dict) -> Response:
+        def invoke() -> Response:
             response = litellm.completion(
                 model=model,
                 messages=[
@@ -263,18 +283,18 @@ def call_api_batch(
             text = response.choices[0].message.content
             if text is None:
                 raise RuntimeError(f"API returned no model response for row {row['position']}")
-            return text
+            return text, response.choices[0].finish_reason
 
         return retry(invoke, attempts, delay_seconds)
 
-    responses: dict[int, str] = {}
+    responses: dict[int, Response] = {}
     first_error: BaseException | None = None
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(one, row): row["position"] for row in rows}
         for future in as_completed(futures):
             position = futures[future]
             try:
-                text = future.result()
+                text, finish_reason = future.result()
             except CancelledError:
                 continue
             except BaseException as error:
@@ -283,8 +303,8 @@ def call_api_batch(
                     for pending in futures:
                         pending.cancel()
             else:
-                on_response(position, text)
-                responses[position] = text
+                on_response(position, text, finish_reason)
+                responses[position] = (text, finish_reason)
 
     if first_error is not None:
         raise first_error
@@ -307,8 +327,8 @@ def call_vllm_batch(
     delay_seconds: float,
     generation_parameters: dict,
     engine_parameters: dict,
-    on_response: Callable[[int, str], None],
-) -> dict[int, str]:
+    on_response: Callable[[int, str, str | None], None],
+) -> dict[int, Response]:
     from vllm import SamplingParams
 
     def invoke() -> list:
@@ -328,13 +348,17 @@ def call_vllm_batch(
     if len(outputs) != len(rows):
         raise RuntimeError(f"vLLM returned {len(outputs)} outputs for {len(rows)} rows")
 
-    responses: dict[int, str] = {}
+    responses: dict[int, Response] = {}
     for row, output in zip(rows, outputs):
-        text = output.outputs[0].text
+        if not output.outputs:
+            raise RuntimeError(f"vLLM returned no model response for row {row['position']}")
+        completion = output.outputs[0]
+        text = completion.text
         if text is None:
             raise RuntimeError(f"vLLM returned no model response for row {row['position']}")
-        on_response(row["position"], text)
-        responses[row["position"]] = text
+        finish_reason = completion.finish_reason
+        on_response(row["position"], text, finish_reason)
+        responses[row["position"]] = (text, finish_reason)
     return responses
 
 
@@ -349,36 +373,50 @@ def open_cache(path: Path) -> sqlite3.Connection:
             config_fingerprint TEXT NOT NULL,
             row_position INTEGER NOT NULL,
             response TEXT NOT NULL,
+            finish_reason TEXT,
             PRIMARY KEY (config_fingerprint, row_position)
         )
         """
     )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(responses)")}
+    if "finish_reason" not in columns:
+        connection.execute("ALTER TABLE responses ADD COLUMN finish_reason TEXT")
     connection.commit()
     return connection
 
 
 def cached_responses(
     connection: sqlite3.Connection | None, fingerprint: str, positions: list[int]
-) -> dict[int, str]:
+) -> dict[int, Response]:
     if connection is None or not positions:
         return {}
     wanted = set(positions)
     rows = connection.execute(
-        "SELECT row_position, response FROM responses WHERE config_fingerprint = ?",
+        "SELECT row_position, response, finish_reason FROM responses "
+        "WHERE config_fingerprint = ?",
         (fingerprint,),
     )
-    return {position: response for position, response in rows if position in wanted}
+    return {
+        position: (response, finish_reason)
+        for position, response, finish_reason in rows
+        if position in wanted
+    }
 
 
 def store_cached_response(
-    connection: sqlite3.Connection | None, fingerprint: str, position: int, response: str
+    connection: sqlite3.Connection | None,
+    fingerprint: str,
+    position: int,
+    response: str,
+    finish_reason: str | None,
 ) -> None:
     if connection is None:
         return
     with connection:
         connection.execute(
-            "INSERT OR REPLACE INTO responses VALUES (?, ?, ?)",
-            (fingerprint, position, response),
+            "INSERT OR REPLACE INTO responses "
+            "(config_fingerprint, row_position, response, finish_reason) VALUES (?, ?, ?, ?)",
+            (fingerprint, position, response, finish_reason),
         )
 
 
@@ -506,8 +544,12 @@ def label_query(
             responses = cached_responses(cache, fingerprint, positions)
             missing_rows = [row for row in rows if row["position"] not in responses]
 
-            def on_response(position: int, response: str) -> None:
-                store_cached_response(cache, fingerprint, position, response)
+            def on_response(
+                position: int, response: str, finish_reason: str | None
+            ) -> None:
+                store_cached_response(
+                    cache, fingerprint, position, response, finish_reason
+                )
 
             if missing_rows:
                 if backend == "api":
@@ -539,7 +581,12 @@ def label_query(
                 missing = sorted(set(positions) - set(responses))
                 raise RuntimeError(f"Q{query_id}: missing model responses for rows {missing[:5]}")
 
-            labels = [parse_bool(responses[position]) for position in positions]
+            labels = [
+                None
+                if responses[position][1] == "length"
+                else parse_bool(responses[position][0])
+                for position in positions
+            ]
             write_fragment_atomic(
                 output_dir,
                 [
@@ -625,6 +672,10 @@ def load_label_config(path: Path) -> dict:
         dataset_path = Path(shared["dataset"])
         backend = section["backend"]
         parameter_key = f"{backend}_parameters"
+        generation_parameters = dict(section.get(parameter_key, {}))
+        if backend == "vllm":
+            # vLLM 0.25.1 otherwise defaults to an output-only limit of 16 tokens.
+            generation_parameters.setdefault("max_tokens", None)
         engine_parameters = (
             dict(section.get("vllm_engine_parameters", {})) if backend == "vllm" else {}
         )
@@ -635,7 +686,7 @@ def load_label_config(path: Path) -> dict:
             "default_system_prompt": section["system_prompt"],
             "backend": backend,
             "model": section["model"],
-            "generation_parameters": dict(section.get(parameter_key, {})),
+            "generation_parameters": generation_parameters,
             "engine_parameters": engine_parameters,
             "query_ids": set(configured_queries) or None,
             "concurrency": section["concurrency"],

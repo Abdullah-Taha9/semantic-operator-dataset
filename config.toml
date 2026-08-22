@@ -1,38 +1,48 @@
 [shared]
 manifest = "queries.jsonl"
-dataset = "datasets/amazon_products.parquet"
+dataset = "datasets/products_filtered_with_embeddings.parquet"
 
 [label]
-backend = "api"
-model = "gpt-5.5"
-system_prompt = "Respond with exactly True or False and no other text."
+backend = "vllm"
+model = "Qwen/Qwen3.8-27B"
+system_prompt = """
+The user will provide a claim and some relevant context.
+Your job is to determine whether the claim is true for the given context.
+Provide your final answer using exactly one of these formats:
+<answer>True</answer>
+<answer>False</answer>
+"""
 queries = []
 concurrency = 16                 # API backend only; vLLM schedules its own batch.
 api_checkpoint_every = 500      # Responses per atomic API fragment.
 vllm_checkpoint_every = 5000    # Prompts per vLLM chat call and atomic fragment.
-attempts = 3
-retry_delay_seconds = 5.0
-enable_cache = true
+attempts = 2
+retry_delay_seconds = 2.0
+enable_cache = false
 
-# No generation parameter is set unless it is uncommented here.
+# No API generation parameter is set unless it is uncommented here.
 [label.api_parameters]
 # max_tokens = 10
 # temperature = 0.0
 # top_p = 1.0
 # seed = 42
 
-# No generation parameter is set unless it is uncommented here.
+# These arguments are passed directly to vllm.SamplingParams. Omitted arguments
+# use vLLM defaults, except max_tokens: omission deliberately means no output-only
 [label.vllm_parameters]
-# max_tokens = 10
-# temperature = 0.0
-# top_p = 1.0
+# temperature = 1.0
+# top_p = 0.95
+# top_k = 20
+# min_p = 0.0
+# presence_penalty = 0.0
+# repetition_penalty = 1.0
 # seed = 42
 
 # Arguments in this table are passed to vllm.LLM when the engine is created.
-# Set this manually to the fewest GPUs needed to fit the model. vLLM does not
-# automatically select the minimum GPU count, and omitted arguments use its defaults.
+# Set this manually to the fewest GPUs needed to fit the model.
 [label.vllm_engine_parameters]
-tensor_parallel_size = 2
+tensor_parallel_size = 4
+max_model_len = 20000
 
 [publish]
 repo_id = "your-org/amazon-products-ground-truth"

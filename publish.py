@@ -117,20 +117,68 @@ def markdown_cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def query_table(manifest: dict, query_ids: list[int]) -> str:
+def read_query_reporting(path: Path) -> dict[int, dict]:
+    reporting: dict[int, dict] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                query_id = raw["id"]
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise ValueError(
+                    f"Invalid query manifest entry on line {line_number}: {error}"
+                ) from error
+            if not isinstance(query_id, int) or isinstance(query_id, bool):
+                raise ValueError(f"Query manifest line {line_number}: id must be an integer")
+            if query_id in reporting:
+                raise ValueError(f"Query manifest line {line_number}: duplicate id {query_id}")
+
+            query_type = raw.get("type")
+            categories = raw.get("category")
+            if query_type is not None and not isinstance(query_type, str):
+                raise ValueError(
+                    f"Query manifest line {line_number}: type must be a string when present"
+                )
+            if categories is not None and (
+                not isinstance(categories, list)
+                or any(not isinstance(category, str) for category in categories)
+            ):
+                raise ValueError(
+                    f"Query manifest line {line_number}: category must be a list of strings "
+                    "when present"
+                )
+            reporting[query_id] = {
+                "type": query_type,
+                "category": categories,
+            }
+    return reporting
+
+
+def query_table(
+    manifest: dict, query_ids: list[int], query_reporting: dict[int, dict] | None = None
+) -> str:
+    query_reporting = query_reporting or {}
     lines = [
-        "| Column | Query | Model | Generated |",
-        "|---|---|---|---|",
+        "| Column | Type | Category | Query | Model | Generated |",
+        "|---|---|---|---|---|---|",
     ]
     for query_id in query_ids:
         entry = manifest[str(query_id)]
         config = entry.get("config", {})
+        reporting = query_reporting.get(query_id, {})
+        query_type = reporting.get("type") or "—"
+        categories = reporting.get("category")
+        category_text = ", ".join(categories) if categories else "—"
         generated = entry.get("completed_at") or entry.get("started_at") or "unknown"
         if generated != "unknown":
             generated = generated[:10]
         lines.append(
-            "| `{column}` | {query} | {model} | {generated} |".format(
+            "| `{column}` | {query_type} | {category} | {query} | {model} | {generated} |".format(
                 column=f"label_q{query_id}",
+                query_type=markdown_cell(query_type),
+                category=markdown_cell(category_text),
                 query=markdown_cell(config.get("filter", "")),
                 model=markdown_cell(config.get("model", "unknown")),
                 generated=markdown_cell(generated),
@@ -147,6 +195,7 @@ def render_card(
     base_filename: str,
     merged_filename: str,
     labels_dirname: str,
+    query_reporting: dict[int, dict] | None = None,
 ) -> str:
     raw_template = template_path.read_text(encoding="utf-8")
     replacements = {
@@ -155,7 +204,7 @@ def render_card(
         "{{BASE_FILENAME}}": base_filename,
         "{{MERGED_FILENAME}}": merged_filename,
         "{{LABELS_DIRNAME}}": labels_dirname,
-        "{{QUERY_TABLE}}": query_table(manifest, query_ids),
+        "{{QUERY_TABLE}}": query_table(manifest, query_ids, query_reporting),
     }
     missing = [marker for marker in replacements if marker not in raw_template]
     if missing:
@@ -189,6 +238,7 @@ def prepare_publish(
     publish_dir: Path,
     query_ids: set[int] | None,
     template_path: Path,
+    query_manifest_path: Path | None = None,
 ) -> dict:
     if not dataset_path.is_file():
         raise FileNotFoundError(f"Base dataset not found: {dataset_path}")
@@ -211,6 +261,9 @@ def prepare_publish(
     base = pq.read_table(dataset_path)
     manifest = read_manifest(manifest_path)
     selected = selected_query_ids(labels_dir, manifest, query_ids)
+    query_reporting = (
+        read_query_reporting(query_manifest_path) if query_manifest_path is not None else {}
+    )
 
     label_columns: dict[int, list[bool | None]] = {}
     for query_id in selected:
@@ -260,6 +313,7 @@ def prepare_publish(
             base_filename,
             merged_filename,
             labels_dirname,
+            query_reporting,
         )
         (temporary / "README.md").write_text(card, encoding="utf-8")
         install_publish_directory(temporary, publish_dir)
@@ -340,6 +394,7 @@ def load_publish_config(path: Path) -> dict:
             "publish_dir": dataset_root / "publish",
             "repo_id": section["repo_id"],
             "template_path": Path(section["card_template"]),
+            "query_manifest_path": Path(shared["manifest"]),
             "query_ids": set(configured_queries) or None,
         }
     except (KeyError, TypeError) as error:
