@@ -11,5 +11,11 @@ dependencies = [
     "python-dotenv",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

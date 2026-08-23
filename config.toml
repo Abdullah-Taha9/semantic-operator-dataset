@@ -19,6 +19,13 @@ vllm_checkpoint_every = 5000    # Prompts per vLLM chat call and atomic fragment
 attempts = 2
 retry_delay_seconds = 2.0
 enable_cache = false
+# Keep capacity-limited rows pending. Set true only when you deliberately want
+# already-known deferred rows finalized as null without another model call.
+finalize_deferred_as_null = false
+# A fresh vLLM query first labels evenly distributed rows as real canary work.
+# It aborts without fragments if too many hit an input or generation length limit.
+canary_rows = 1000
+canary_max_deferred_fraction = 0.20
 
 # No API generation parameter is set unless it is uncommented here.
 [label.api_parameters]

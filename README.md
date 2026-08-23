@@ -55,6 +55,9 @@ Set `tensor_parallel_size` manually to the fewest GPUs required to fit the model
 does not automatically choose that number. GPU visibility remains controlled by the
 runtime environment, such as `CUDA_VISIBLE_DEVICES`. Omitted engine arguments use vLLM
 defaults, and configured engine arguments are also included in the query fingerprint.
+`tensor_parallel_size` and `max_model_len` are operational exceptions and are excluded:
+the former changes placement, while the latter may be increased between resumptions to
+redrive only capacity-deferred positions.
 
 ## Query manifest
 
@@ -92,8 +95,8 @@ python label.py --force
 
 `--force` discards and regenerates selected query results only when the current
 configuration fingerprint matches their existing fingerprint. A changed model, prompt,
-backend, generation parameters, vLLM engine parameters, or base dataset is refused while
-fragments exist. To make a deliberate methodology change, delete that query's
+backend, generation parameters, fingerprinted vLLM engine parameters, or base dataset is
+refused while fragments exist. To make a deliberate methodology change, delete that query's
 `query_id=N/` directory and run again.
 
 Each completed checkpoint becomes an atomic Parquet fragment:
@@ -104,24 +107,47 @@ datasets/amazon_products/labels/
 ├── .cache/                     # local recovery state; never published
 └── query_id=1/
     ├── part-....parquet
-    └── part-....parquet
+    ├── part-....parquet
+    ├── deferred.parquet            # present only while positions remain pending
+    └── finalized_deferred.parquet  # explicit capacity-null audit, when applicable
 ```
 
 Re-running automatically skips positions already present in fragments. With caching
-enabled, successful responses in an interrupted checkpoint are also reused. Once a
-fragment is committed, its response-cache entries are removed.
+enabled, completed vLLM outputs are parsed and committed to SQLite as the engine
+finishes them, before the enclosing fragment is complete. Once an atomic fragment is
+committed, its now-redundant cache entries are removed. The cache uses SQLite WAL mode
+with `synchronous=NORMAL`: committed entries survive a killed Python job, though a
+whole-machine crash can lose the most recent cache transactions.
 
 The parser ignores any surrounding reasoning and selects the last complete
 `<answer>...</answer>` block. After trimming and case-folding its contents, `true`, `1`,
 and `yes` map to true; `false`, `0`, and `no` map to false. A missing or invalid final
-tag becomes a null label. A response whose finish reason is `length` also becomes null,
-even if an earlier complete answer tag exists. Rendering, missing-response,
-model-call, output-count, storage, and schema failures abort the run.
+tag becomes a completed null label.
 
-API concurrency applies only to independent LiteLLM requests. The vLLM backend instead
-passes up to `vllm_checkpoint_every` prompts to one synchronous `LLM.chat()` call, and
-vLLM schedules that group internally. The next group is submitted after the current
-group returns and its fragment is written atomically.
+For vLLM, a prompt rejected for exceeding the model context and any response whose
+finish reason is `length` are deferred instead. Deferred positions are omitted from
+normal fragments, recorded by row position in `deferred.parquet`, and retried
+automatically on the next invocation because positional resume processes every missing
+position. Increase `max_model_len` and rerun as many times as needed. Publishing remains
+blocked while any positions are missing.
+
+A fresh vLLM query first processes `canary_rows` evenly distributed positions. If more
+than `canary_max_deferred_fraction` hit an input or generation length limit, the query
+aborts without writing canary fragments. This catches configurations such as
+`max_model_len = 20` without depending on consecutive dataset rows.
+
+Setting `finalize_deferred_as_null = true` converts already-known deferred positions to
+completed nulls without another model call. Newly encountered capacity-limited rows are
+also finalized as null, but the fresh-query canary check still takes precedence. The
+manifest and dataset card report parser nulls and explicitly finalized capacity nulls
+separately. Rendering, missing-response, model-call, storage, schema, CUDA, and engine
+failures abort the run.
+
+API concurrency applies only to independent LiteLLM requests. The vLLM backend enqueues
+up to `vllm_checkpoint_every` prompts individually so a bad input can be isolated, then
+lets vLLM schedule all accepted requests together with continuous batching. A small
+engine-step loop observes completed outputs for incremental caching; it is the same
+underlying mechanism used by vLLM's `wait_for_completion()`.
 
 ## Publishing
 

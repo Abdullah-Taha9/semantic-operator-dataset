@@ -16,7 +16,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 
-
 load_dotenv()
 
 
@@ -38,22 +37,30 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def selected_query_ids(labels_dir: Path, manifest: dict, query_ids: set[int] | None) -> list[int]:
+def selected_query_ids(
+    labels_dir: Path, manifest: dict, query_ids: set[int] | None
+) -> list[int]:
     available: set[int] = set()
     for path in labels_dir.glob("query_id=*"):
         if path.is_dir():
             try:
                 available.add(int(path.name.split("=", 1)[1]))
             except ValueError as error:
-                raise ValueError(f"Invalid query directory name: {path.name}") from error
+                raise ValueError(
+                    f"Invalid query directory name: {path.name}"
+                ) from error
 
     selected = available if query_ids is None else query_ids
     missing_dirs = selected - available
     if missing_dirs:
-        raise ValueError(f"Missing fragment directories for queries: {sorted(missing_dirs)}")
+        raise ValueError(
+            f"Missing fragment directories for queries: {sorted(missing_dirs)}"
+        )
     missing_manifest = selected - {int(key) for key in manifest}
     if missing_manifest:
-        raise ValueError(f"Missing manifest entries for queries: {sorted(missing_manifest)}")
+        raise ValueError(
+            f"Missing manifest entries for queries: {sorted(missing_manifest)}"
+        )
     if not selected:
         raise ValueError("No query fragment directories found")
     return sorted(selected)
@@ -131,9 +138,13 @@ def read_query_reporting(path: Path) -> dict[int, dict]:
                     f"Invalid query manifest entry on line {line_number}: {error}"
                 ) from error
             if not isinstance(query_id, int) or isinstance(query_id, bool):
-                raise ValueError(f"Query manifest line {line_number}: id must be an integer")
+                raise ValueError(
+                    f"Query manifest line {line_number}: id must be an integer"
+                )
             if query_id in reporting:
-                raise ValueError(f"Query manifest line {line_number}: duplicate id {query_id}")
+                raise ValueError(
+                    f"Query manifest line {line_number}: duplicate id {query_id}"
+                )
 
             query_type = raw.get("type")
             categories = raw.get("category")
@@ -161,8 +172,8 @@ def query_table(
 ) -> str:
     query_reporting = query_reporting or {}
     lines = [
-        "| Column | Type | Category | Query | Model | Generated |",
-        "|---|---|---|---|---|---|",
+        "| Column | Type | Category | Query | Model | Unparseable | Finalized deferred | Generated |",
+        "|---|---|---|---|---|---:|---:|---|",
     ]
     for query_id in query_ids:
         entry = manifest[str(query_id)]
@@ -172,15 +183,21 @@ def query_table(
         categories = reporting.get("category")
         category_text = ", ".join(categories) if categories else "—"
         generated = entry.get("completed_at") or entry.get("started_at") or "unknown"
+        finalized_deferred = entry.get("n_finalized_input_too_long", 0) + entry.get(
+            "n_finalized_generation_length", 0
+        )
         if generated != "unknown":
             generated = generated[:10]
         lines.append(
-            "| `{column}` | {query_type} | {category} | {query} | {model} | {generated} |".format(
+            "| `{column}` | {query_type} | {category} | {query} | {model} | "
+            "{unparseable} | {finalized_deferred} | {generated} |".format(
                 column=f"label_q{query_id}",
                 query_type=markdown_cell(query_type),
                 category=markdown_cell(category_text),
                 query=markdown_cell(config.get("filter", "")),
                 model=markdown_cell(config.get("model", "unknown")),
+                unparseable=entry.get("n_unparseable", 0),
+                finalized_deferred=finalized_deferred,
                 generated=markdown_cell(generated),
             )
         )
@@ -219,9 +236,12 @@ def copy_label_audit(
     labels_dir: Path, destination: Path, manifest: dict, query_ids: list[int]
 ) -> None:
     destination.mkdir(parents=True)
-    selected_manifest = {str(query_id): manifest[str(query_id)] for query_id in query_ids}
+    selected_manifest = {
+        str(query_id): manifest[str(query_id)] for query_id in query_ids
+    }
     (destination / "manifest.json").write_text(
-        json.dumps(selected_manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(selected_manifest, indent=2, sort_keys=True, ensure_ascii=False)
+        + "\n",
         encoding="utf-8",
     )
     for query_id in query_ids:
@@ -230,6 +250,10 @@ def copy_label_audit(
         destination_query_dir.mkdir()
         for fragment_path in sorted(source_query_dir.glob("part-*.parquet")):
             shutil.copy2(fragment_path, destination_query_dir / fragment_path.name)
+        for audit_name in ("deferred.parquet", "finalized_deferred.parquet"):
+            audit_path = source_query_dir / audit_name
+            if audit_path.is_file():
+                shutil.copy2(audit_path, destination_query_dir / audit_name)
 
 
 def prepare_publish(
@@ -247,12 +271,17 @@ def prepare_publish(
     dataset_resolved = dataset_path.resolve()
     labels_resolved = labels_dir.resolve()
     publish_resolved = publish_dir.resolve()
-    if publish_resolved == Path(publish_resolved.anchor) or publish_resolved == Path.cwd().resolve():
+    if (
+        publish_resolved == Path(publish_resolved.anchor)
+        or publish_resolved == Path.cwd().resolve()
+    ):
         raise ValueError(f"Refusing unsafe publish destination: {publish_dir}")
     if publish_resolved in dataset_resolved.parents:
         raise ValueError("Publish destination cannot contain the pristine base dataset")
     if publish_resolved in labels_resolved.parents:
-        raise ValueError("Publish destination cannot contain the source labels directory")
+        raise ValueError(
+            "Publish destination cannot contain the source labels directory"
+        )
     manifest_path = labels_dir / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Label manifest not found: {manifest_path}")
@@ -262,14 +291,21 @@ def prepare_publish(
     manifest = read_manifest(manifest_path)
     selected = selected_query_ids(labels_dir, manifest, query_ids)
     query_reporting = (
-        read_query_reporting(query_manifest_path) if query_manifest_path is not None else {}
+        read_query_reporting(query_manifest_path)
+        if query_manifest_path is not None
+        else {}
     )
 
     label_columns: dict[int, list[bool | None]] = {}
     for query_id in selected:
         entry = manifest[str(query_id)]
+        query_dir = labels_dir / f"query_id={query_id}"
         if not entry.get("config_fingerprint"):
             raise ValueError(f"Q{query_id}: manifest has no trusted config fingerprint")
+        if entry.get("n_deferred", 0) or (query_dir / "deferred.parquet").exists():
+            raise ValueError(
+                f"Q{query_id}: deferred rows remain; rerun labeling or explicitly finalize them"
+            )
         if entry.get("n_rows") != base.num_rows:
             raise ValueError(
                 f"Q{query_id}: manifest row count {entry.get('n_rows')} "
@@ -282,9 +318,7 @@ def prepare_publish(
             raise ValueError(
                 f"Q{query_id}: base dataset SHA-256 does not match the file used for labeling"
             )
-        label_columns[query_id] = read_complete_labels(
-            labels_dir / f"query_id={query_id}", base.num_rows
-        )
+        label_columns[query_id] = read_complete_labels(query_dir, base.num_rows)
 
     merged = base
     for query_id in selected:
@@ -297,7 +331,9 @@ def prepare_publish(
 
     publish_parent = publish_dir.parent
     publish_parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{publish_dir.name}-", dir=publish_parent))
+    temporary = Path(
+        tempfile.mkdtemp(prefix=f".{publish_dir.name}-", dir=publish_parent)
+    )
     base_filename = dataset_path.name
     merged_filename = f"{dataset_path.stem}.merged.parquet"
     labels_dirname = labels_dir.name

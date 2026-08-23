@@ -230,3 +230,4 @@ uv.lock
 runs/
 slurm_logs/
 queries
+tests/
