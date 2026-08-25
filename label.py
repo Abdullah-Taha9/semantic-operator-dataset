@@ -1,17 +1,23 @@
 """Generate checkpointed boolean labels for every row of one Parquet dataset."""
-
 from __future__ import annotations
 
+import os
+os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+os.environ["VLLM_DISABLE_REQUEST_ID_RANDOMIZATION"]="1"
+os.environ["LABEL_PRINT_VLLM_SAMPLES"] = "5"
+
+
 import argparse
+import fcntl
 import hashlib
 import json
-import os
 import re
 import shutil
 import sqlite3
 import time
 import tomllib
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from string import Formatter
@@ -25,9 +31,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 _VLLM_ENGINE = None
-_ANSWER_PATTERN = re.compile(r"<answer>([^<>]*?)</answer>", re.IGNORECASE | re.DOTALL)
+_VLLM_SAMPLE_LIMIT = max(
+    0, int(os.environ.get("LABEL_PRINT_VLLM_SAMPLES", "0"))
+)
+_VLLM_SAMPLES_PRINTED = 0
+_TERMINAL_ANSWER_PATTERN = re.compile(
+    r"<answer>([^<>]*?)</answer>\s*[.!]?\s*\Z", re.IGNORECASE | re.DOTALL
+)
+_THINK_OPEN_PATTERN = re.compile(r"<think\s*>", re.IGNORECASE)
+_THINK_CLOSE_PATTERN = re.compile(r"</think\s*>", re.IGNORECASE)
+_BARE_ANSWER_PREFIX_PATTERN = re.compile(
+    r"(?:final\s+)?answer\s*:\s*", re.IGNORECASE
+)
 _TRUE_ANSWERS = frozenset({"true", "1", "yes"})
 _FALSE_ANSWERS = frozenset({"false", "0", "no"})
+_FINGERPRINT_EXCLUDED_ENGINE_PARAMETERS = frozenset(
+    {
+        "gpu_memory_utilization",
+        "max_model_len",
+        "max_num_seqs",
+        "tensor_parallel_size",
+    }
+)
 _T = TypeVar("_T")
 Response = tuple[str, str | None]
 Outcome = tuple[bool | None, str]
@@ -143,8 +168,8 @@ def query_config(
 def config_fingerprint(config: dict) -> str:
     fingerprinted_config = dict(config)
     engine_parameters = dict(fingerprinted_config.get("engine_parameters", {}))
-    engine_parameters.pop("tensor_parallel_size", None)
-    engine_parameters.pop("max_model_len", None)
+    for parameter in _FINGERPRINT_EXCLUDED_ENGINE_PARAMETERS:
+        engine_parameters.pop(parameter, None)
     fingerprinted_config["engine_parameters"] = engine_parameters
     encoded = json.dumps(
         fingerprinted_config,
@@ -178,6 +203,25 @@ def write_manifest_atomic(path: Path, manifest: dict) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def query_lock(output_root: Path, query_id: int):
+    """Exclusively own one query without relying on persistent lock-file state."""
+    lock_dir = output_root / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"query_id={query_id}.lock"
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"Q{query_id}: another labeling or publishing process holds the query lock"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def fragment_state(output_dir: Path, n_rows: int) -> tuple[set[int], set[int]]:
@@ -290,16 +334,118 @@ def write_reason_ledger_atomic(path: Path, entries: dict[int, str]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def parse_bool(response: str) -> bool | None:
-    matches = list(_ANSWER_PATTERN.finditer(response))
-    if not matches:
-        return None
-    normalized = matches[-1].group(1).strip().casefold()
+def parse_answer_value(value: str) -> bool | None:
+    normalized = value.strip().casefold()
     if normalized in _TRUE_ANSWERS:
         return True
     if normalized in _FALSE_ANSWERS:
         return False
     return None
+
+def final_answer_region(response: str) -> str | None:
+    """Return model-visible final text, excluding a completed thinking block."""
+    closing_think_tags = list(_THINK_CLOSE_PATTERN.finditer(response))
+    if closing_think_tags:
+        region = response[closing_think_tags[-1].end() :]
+    elif _THINK_OPEN_PATTERN.search(response):
+        return None
+    else:
+        region = response
+
+    if _THINK_OPEN_PATTERN.search(region):
+        return None
+
+    region = region.rstrip()
+    lines = region.splitlines()
+    if lines and lines[-1].strip() == "```":
+        region = "\n".join(lines[:-1]).rstrip()
+    return region
+
+
+def parse_terminal_bare_answer(line: str) -> bool | None:
+    candidate = line.strip()
+    if candidate.endswith((".", "!")):
+        candidate = candidate[:-1].rstrip()
+
+    for marker in ("**", "__", "`"):
+        if (
+            candidate.startswith(marker)
+            and candidate.endswith(marker)
+            and len(candidate) > 2 * len(marker)
+        ):
+            candidate = candidate[len(marker) : -len(marker)].strip()
+            break
+
+    prefix = _BARE_ANSWER_PREFIX_PATTERN.match(candidate)
+    if prefix:
+        candidate = candidate[prefix.end() :]
+    return parse_answer_value(candidate)
+
+
+def parse_bool(response: str) -> bool | None:
+    region = final_answer_region(response)
+    if region is None or not region:
+        return None
+
+    terminal_tag = _TERMINAL_ANSWER_PATTERN.search(region)
+    if terminal_tag:
+        return parse_answer_value(terminal_tag.group(1))
+
+    return parse_terminal_bare_answer(region.splitlines()[-1])
+
+
+def print_vllm_sample(
+    row_position: int,
+    prompt: str | None,
+    prompt_token_ids: list[int] | None,
+    response: str,
+    parsed_label: bool | None,
+    finish_reason: str | None,
+) -> None:
+    global _VLLM_SAMPLES_PRINTED
+
+    if _VLLM_SAMPLES_PRINTED >= _VLLM_SAMPLE_LIMIT:
+        return
+    _VLLM_SAMPLES_PRINTED += 1
+
+    def text_preview(value: str | None) -> str | None:
+        if value is None or len(value) <= 12_000:
+            return value
+        omitted = len(value) - 10_000
+        return (
+            value[:2_000]
+            + f"\n... [{omitted} characters omitted] ...\n"
+            + value[-8_000:]
+        )
+
+    if prompt_token_ids is None or len(prompt_token_ids) <= 256:
+        token_preview: object = prompt_token_ids
+    else:
+        token_preview = {
+            "head": prompt_token_ids[:128],
+            "omitted": len(prompt_token_ids) - 256,
+            "tail": prompt_token_ids[-128:],
+        }
+
+    # ASCII JSON escaping keeps generated control characters from affecting logs.
+    encoded_prompt = json.dumps(text_preview(prompt), ensure_ascii=True)
+    encoded_tokens = json.dumps(token_preview, ensure_ascii=True)
+    encoded_response = json.dumps(text_preview(response), ensure_ascii=True)
+    input_tokens = None if prompt_token_ids is None else len(prompt_token_ids)
+    try:
+        print(
+            f"[vLLM sample {_VLLM_SAMPLES_PRINTED}/{_VLLM_SAMPLE_LIMIT} "
+            f"row_position={row_position} parsed={parsed_label!r} "
+            f"finish_reason={finish_reason!r} input_tokens={input_tokens!r}]\n"
+            f"rendered_prompt={encoded_prompt}\n"
+            f"prompt_token_ids={encoded_tokens}\n"
+            f"generated_output={encoded_response}\n"
+            "[/vLLM sample]",
+            flush=True,
+        )
+    except OSError:
+        # Diagnostic output must never interrupt labeling.
+        pass
 
 
 def render_rows(
@@ -458,10 +604,18 @@ def call_vllm_batch(
             raise RuntimeError(
                 f"vLLM returned {len(request_ids)} request ids for row {row['position']}"
             )
-        request_id = str(request_ids[0])
-        if request_id in request_positions:
-            raise RuntimeError(f"vLLM returned duplicate request id {request_id}")
-        request_positions[request_id] = row["position"]
+        internal_request_id = str(request_ids[0])
+        external_request_id = internal_request_id.partition("-")[0]
+        if not external_request_id.isdecimal():
+            raise RuntimeError(
+                "vLLM returned an unexpected internal request id "
+                f"{internal_request_id!r}"
+            )
+        if external_request_id in request_positions:
+            raise RuntimeError(
+                f"vLLM returned duplicate external request id {external_request_id}"
+            )
+        request_positions[external_request_id] = row["position"]
 
     if deferred:
         on_deferred(dict(deferred))
@@ -491,6 +645,14 @@ def call_vllm_batch(
                     f"vLLM returned no model response for row {position}"
                 )
             label = parse_bool(completion.text)
+            print_vllm_sample(
+                position,
+                output.prompt,
+                output.prompt_token_ids,
+                completion.text,
+                label,
+                completion.finish_reason,
+            )
             finished_in_step[position] = (
                 label,
                 "labelled" if label is not None else "unparseable",
@@ -602,12 +764,6 @@ def delete_cached_positions(
         )
 
 
-def delete_cache_files(path: Path) -> None:
-    path.unlink(missing_ok=True)
-    path.with_name(path.name + "-wal").unlink(missing_ok=True)
-    path.with_name(path.name + "-shm").unlink(missing_ok=True)
-
-
 def update_progress(
     manifest_path: Path,
     query_id: int,
@@ -644,7 +800,7 @@ def evenly_spaced_positions(n_rows: int, sample_size: int) -> list[int]:
     ]
 
 
-def label_query(
+def _label_query_locked(
     query: dict,
     dataset_path: Path,
     output_root: Path,
@@ -665,8 +821,8 @@ def label_query(
 ) -> None:
     query_id = query["id"]
     output_dir = output_root / f"query_id={query_id}"
-    manifest_path = output_root / "manifest.json"
-    cache_path = output_root / ".cache" / f"query_id={query_id}.sqlite3"
+    manifest_path = output_dir / "manifest.json"
+    cache_path = output_dir / "cache.sqlite3"
     deferred_path = output_dir / "deferred.parquet"
     finalized_path = output_dir / "finalized_deferred.parquet"
     config = query_config(
@@ -675,16 +831,28 @@ def label_query(
     fingerprint = config_fingerprint(config)
 
     manifest = read_manifest(manifest_path)
+    expected_manifest_keys = {str(query_id)}
+    if manifest and set(manifest) != expected_manifest_keys:
+        raise RuntimeError(
+            f"Q{query_id}: {manifest_path} must contain exactly the key "
+            f"{str(query_id)!r}"
+        )
     existing_entry = manifest.get(str(query_id))
     result_dir_exists = output_dir.exists()
 
     if result_dir_exists:
         if not existing_entry or not existing_entry.get("config_fingerprint"):
-            raise RuntimeError(
-                f"Q{query_id}: a result directory exists without a trusted manifest fingerprint; "
-                "delete the query directory manually to start over"
-            )
-        if existing_entry["config_fingerprint"] != fingerprint:
+            persistent_state = [
+                path
+                for path in output_dir.iterdir()
+                if not path.name.startswith(".tmp-")
+            ]
+            if persistent_state:
+                raise RuntimeError(
+                    f"Q{query_id}: a result directory exists without a trusted manifest "
+                    "fingerprint; delete the query directory manually to start over"
+                )
+        if existing_entry and existing_entry["config_fingerprint"] != fingerprint:
             raise RuntimeError(
                 f"Q{query_id}: configuration does not match existing fragments; "
                 "delete the query directory manually to change methodology"
@@ -693,11 +861,8 @@ def label_query(
     if force:
         if output_dir.exists():
             shutil.rmtree(output_dir)
-        delete_cache_files(cache_path)
-        manifest = read_manifest(manifest_path)
-        manifest.pop(str(query_id), None)
-        write_manifest_atomic(manifest_path, manifest)
         existing_entry = None
+        result_dir_exists = False
 
     output_dir.mkdir(parents=True, exist_ok=True)
     done, null_positions = fragment_state(output_dir, identity["n_rows"])
@@ -975,6 +1140,49 @@ def label_query(
             cache.close()
 
 
+def label_query(
+    query: dict,
+    dataset_path: Path,
+    output_root: Path,
+    backend: str,
+    model: str,
+    generation_parameters: dict,
+    engine_parameters: dict,
+    identity: dict,
+    checkpoint_every: int,
+    concurrency: int,
+    attempts: int,
+    delay_seconds: float,
+    enable_cache: bool,
+    finalize_deferred_as_null: bool,
+    canary_rows: int,
+    canary_max_deferred_fraction: float,
+    force: bool,
+) -> None:
+    """Label one query while holding its cross-process lifetime lock."""
+    query_id = query["id"]
+    with query_lock(output_root, query_id):
+        _label_query_locked(
+            query,
+            dataset_path,
+            output_root,
+            backend,
+            model,
+            generation_parameters,
+            engine_parameters,
+            identity,
+            checkpoint_every,
+            concurrency,
+            attempts,
+            delay_seconds,
+            enable_cache,
+            finalize_deferred_as_null,
+            canary_rows,
+            canary_max_deferred_fraction,
+            force,
+        )
+
+
 def run_labeling(
     manifest_path: Path,
     dataset_path: Path,
@@ -1085,12 +1293,24 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument(
+        "--queries",
+        type=int,
+        nargs="+",
+        metavar="ID",
+        help="Process these query IDs instead of the query selection in config.toml",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Discard and regenerate selected queries only when their fingerprints match",
     )
     args = parser.parse_args()
-    run_labeling(**load_label_config(args.config), force=args.force)
+    if args.queries is not None and len(set(args.queries)) != len(args.queries):
+        parser.error("--queries must not contain duplicate IDs")
+    settings = load_label_config(args.config)
+    if args.queries is not None:
+        settings["query_ids"] = set(args.queries)
+    run_labeling(**settings, force=args.force)
 
 
 if __name__ == "__main__":

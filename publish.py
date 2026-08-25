@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import shutil
 import tempfile
 import tomllib
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +31,33 @@ def read_manifest(path: Path) -> dict:
     return manifest
 
 
+@contextmanager
+def query_lock(labels_dir: Path, query_id: int):
+    lock_dir = labels_dir / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"query_id={query_id}.lock"
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"Q{query_id}: labeling is active; refusing to publish a changing query"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def query_locks(labels_dir: Path, query_ids: list[int]):
+    """Hold selected query locks in a stable order for one publication snapshot."""
+    with ExitStack() as stack:
+        for query_id in sorted(query_ids):
+            stack.enter_context(query_lock(labels_dir, query_id))
+        yield
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -37,9 +66,7 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def selected_query_ids(
-    labels_dir: Path, manifest: dict, query_ids: set[int] | None
-) -> list[int]:
+def selected_query_ids(labels_dir: Path, query_ids: set[int] | None) -> list[int]:
     available: set[int] = set()
     for path in labels_dir.glob("query_id=*"):
         if path.is_dir():
@@ -56,14 +83,29 @@ def selected_query_ids(
         raise ValueError(
             f"Missing fragment directories for queries: {sorted(missing_dirs)}"
         )
-    missing_manifest = selected - {int(key) for key in manifest}
-    if missing_manifest:
-        raise ValueError(
-            f"Missing manifest entries for queries: {sorted(missing_manifest)}"
-        )
     if not selected:
         raise ValueError("No query fragment directories found")
     return sorted(selected)
+
+
+def read_query_manifests(labels_dir: Path, query_ids: list[int]) -> dict:
+    aggregate: dict[str, dict] = {}
+    for query_id in query_ids:
+        manifest_path = labels_dir / f"query_id={query_id}" / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Q{query_id}: manifest not found: {manifest_path}")
+        query_manifest = read_manifest(manifest_path)
+        expected_key = str(query_id)
+        if set(query_manifest) != {expected_key}:
+            raise ValueError(
+                f"Q{query_id}: {manifest_path} must contain exactly the key "
+                f"{expected_key!r}"
+            )
+        entry = query_manifest[expected_key]
+        if not isinstance(entry, dict):
+            raise ValueError(f"Q{query_id}: manifest entry must be a JSON object")
+        aggregate[expected_key] = entry
+    return aggregate
 
 
 def read_complete_labels(query_dir: Path, n_rows: int) -> list[bool | None]:
@@ -256,7 +298,7 @@ def copy_label_audit(
                 shutil.copy2(audit_path, destination_query_dir / audit_name)
 
 
-def prepare_publish(
+def _prepare_publish_locked(
     dataset_path: Path,
     labels_dir: Path,
     publish_dir: Path,
@@ -282,14 +324,10 @@ def prepare_publish(
         raise ValueError(
             "Publish destination cannot contain the source labels directory"
         )
-    manifest_path = labels_dir / "manifest.json"
-    if not manifest_path.is_file():
-        raise FileNotFoundError(f"Label manifest not found: {manifest_path}")
-
     base_hash = file_sha256(dataset_path)
     base = pq.read_table(dataset_path)
-    manifest = read_manifest(manifest_path)
-    selected = selected_query_ids(labels_dir, manifest, query_ids)
+    selected = selected_query_ids(labels_dir, query_ids)
+    manifest = read_query_manifests(labels_dir, selected)
     query_reporting = (
         read_query_reporting(query_manifest_path)
         if query_manifest_path is not None
@@ -366,6 +404,28 @@ def prepare_publish(
     }
 
 
+def prepare_publish(
+    dataset_path: Path,
+    labels_dir: Path,
+    publish_dir: Path,
+    query_ids: set[int] | None,
+    template_path: Path,
+    query_manifest_path: Path | None = None,
+) -> dict:
+    if not labels_dir.is_dir():
+        raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
+    selected = selected_query_ids(labels_dir, query_ids)
+    with query_locks(labels_dir, selected):
+        return _prepare_publish_locked(
+            dataset_path,
+            labels_dir,
+            publish_dir,
+            set(selected),
+            template_path,
+            query_manifest_path,
+        )
+
+
 def install_publish_directory(temporary: Path, publish_dir: Path) -> None:
     old = publish_dir.with_name(f".{publish_dir.name}.old")
     if old.exists():
@@ -400,7 +460,7 @@ def upload_to_hub(repo_id: str, publish_dir: Path) -> str:
     api.create_repo(
         repo_id=repo_id,
         repo_type="dataset",
-        private=True,
+        private=False,
         exist_ok=True,
     )
     commit = api.upload_folder(
@@ -440,8 +500,19 @@ def load_publish_config(path: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
+    parser.add_argument(
+        "--queries",
+        type=int,
+        nargs="+",
+        metavar="ID",
+        help="Publish these query IDs instead of the query selection in config.toml",
+    )
     args = parser.parse_args()
+    if args.queries is not None and len(set(args.queries)) != len(args.queries):
+        parser.error("--queries must not contain duplicate IDs")
     settings = load_publish_config(args.config)
+    if args.queries is not None:
+        settings["query_ids"] = set(args.queries)
     repo_id = settings.pop("repo_id")
     artifacts = prepare_publish(**settings)
     commit_hash = upload_to_hub(repo_id, artifacts["publish_dir"])
