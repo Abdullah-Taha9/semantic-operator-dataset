@@ -1,0 +1,119 @@
+{
+  "generated_at": "2026-08-24T02:00:52.535304",
+  "datasets": [
+    {
+      "dataset_name": "PRODUCTS",
+      "file_path": "datasets/products_filtered_with_embeddings.parquet",
+      "analyzed_columns": [
+        "product_title",
+        "features_json",
+        "description_json",
+        "details_json"
+      ],
+      "total_rows": 45693,
+      "char_per_token_ratio": 3.8,
+      "metrics": {
+        "min_characters": 213,
+        "min_est_tokens": 56,
+        "max_characters": 74880,
+        "max_est_tokens": 19705,
+        "mean_characters": 1613.07,
+        "mean_est_tokens": 424,
+        "std_characters": 929.91
+      },
+      "percentiles": {
+        "p25": {
+          "quantile": 0.25,
+          "characters": 977,
+          "est_tokens": 257
+        },
+        "p50": {
+          "quantile": 0.5,
+          "characters": 1349,
+          "est_tokens": 355
+        },
+        "p75": {
+          "quantile": 0.75,
+          "characters": 2085,
+          "est_tokens": 548
+        },
+        "p90": {
+          "quantile": 0.9,
+          "characters": 2843,
+          "est_tokens": 748
+        },
+        "p95": {
+          "quantile": 0.95,
+          "characters": 3272,
+          "est_tokens": 861
+        },
+        "p99": {
+          "quantile": 0.99,
+          "characters": 4063,
+          "est_tokens": 1069
+        },
+        "p99.9": {
+          "quantile": 0.999,
+          "characters": 7074,
+          "est_tokens": 1861
+        }
+      }
+    },
+    {
+      "dataset_name": "REVIEWS",
+      "file_path": "datasets/reviews_filtered_with_embeddings.parquet",
+      "analyzed_columns": [
+        "review_title",
+        "review_text"
+      ],
+      "total_rows": 936216,
+      "char_per_token_ratio": 3.8,
+      "metrics": {
+        "min_characters": 2,
+        "min_est_tokens": 0,
+        "max_characters": 20226,
+        "max_est_tokens": 5322,
+        "mean_characters": 183.63,
+        "mean_est_tokens": 48,
+        "std_characters": 272.76
+      },
+      "percentiles": {
+        "p25": {
+          "quantile": 0.25,
+          "characters": 49,
+          "est_tokens": 12
+        },
+        "p50": {
+          "quantile": 0.5,
+          "characters": 106,
+          "est_tokens": 27
+        },
+        "p75": {
+          "quantile": 0.75,
+          "characters": 216,
+          "est_tokens": 56
+        },
+        "p90": {
+          "quantile": 0.9,
+          "characters": 403,
+          "est_tokens": 106
+        },
+        "p95": {
+          "quantile": 0.95,
+          "characters": 587,
+          "est_tokens": 154
+        },
+        "p99": {
+          "quantile": 0.99,
+          "characters": 1234,
+          "est_tokens": 324
+        },
+        "p99.9": {
+          "quantile": 0.999,
+          "characters": 2903,
+          "est_tokens": 763
+        }
+      }
+    }
+  ]
+}

@@ -229,3 +229,11 @@ requirements.backup.txt
 uv.lock
 runs/
 slurm_logs/
+queries/*
+!queries/queries_products.jsonl
+!queries/queries_reviews.jsonl
+tests/
+confs/draft
+draft/
+stats/*
+!stats/datasets_stats.json

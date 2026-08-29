@@ -1,6 +1,6 @@
 [shared]
-manifest = "queries.jsonl"
-dataset = "datasets/products_filtered_with_embeddings.parquet"
+manifest = "queries/queries_reviews.jsonl"
+dataset = "datasets/reviews_filtered_with_embeddings.parquet"
 
 [label]
 backend = "vllm"
@@ -15,15 +15,11 @@ Provide your final answer using exactly one of these formats:
 queries = []
 concurrency = 16                 # API backend only; vLLM schedules its own batch.
 api_checkpoint_every = 500      # Responses per atomic API fragment.
-vllm_checkpoint_every = 5000    # Prompts per vLLM chat call and atomic fragment.
-attempts = 2
-retry_delay_seconds = 2.0
-enable_cache = false
-# Keep capacity-limited rows pending. Set true only when you deliberately want
-# already-known deferred rows finalized as null without another model call.
-finalize_deferred_as_null = false
-# A fresh vLLM query first labels evenly distributed rows as real canary work.
-# It aborts without fragments if too many hit an input or generation length limit.
+vllm_checkpoint_every = 50000    # Prompts per vLLM chat call and atomic fragment.
+attempts = 1
+retry_delay_seconds = 1.0
+enable_cache = true
+finalize_deferred_as_null = false # Rows with error 'length' from vllm are not proceed, True would set those to null
 canary_rows = 1000
 canary_max_deferred_fraction = 0.20
 
@@ -48,10 +44,15 @@ canary_max_deferred_fraction = 0.20
 # Arguments in this table are passed to vllm.LLM when the engine is created.
 # Set this manually to the fewest GPUs needed to fit the model.
 [label.vllm_engine_parameters]
-tensor_parallel_size = 2
-max_model_len = 20000
+tensor_parallel_size = 2 # change based on number of GPUs 
+gpu_memory_utilization = 0.92
+max_model_len = 4000
+max_num_seqs = 512
 
 [publish]
-repo_id = "your-org/amazon-products-ground-truth"
+title = "Semantic Filter Labels for SemCEB Reviews"
+repo_id = "Abdullah-Taha/reviews-filtered-labels"
+citation_author = "Taha, Abdullah"
+citation_year = 2026
 card_template = "card_template.md"
 queries = []
