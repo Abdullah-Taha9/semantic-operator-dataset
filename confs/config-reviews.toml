@@ -1,5 +1,5 @@
 [shared]
-manifest = "queries_reviews.jsonl"
+manifest = "queries/queries_reviews.jsonl"
 dataset = "datasets/reviews_filtered_with_embeddings.parquet"
 
 [label]
@@ -44,13 +44,15 @@ canary_max_deferred_fraction = 0.20
 # Arguments in this table are passed to vllm.LLM when the engine is created.
 # Set this manually to the fewest GPUs needed to fit the model.
 [label.vllm_engine_parameters]
-tensor_parallel_size = 2
+tensor_parallel_size = 2 # change based on number of GPUs 
 gpu_memory_utilization = 0.92
 max_model_len = 4000
 max_num_seqs = 512
 
-
 [publish]
-repo_id = "your-org/amazon-products-ground-truth-review"
+title = "Semantic Filter Labels for SemCEB Reviews"
+repo_id = "Abdullah-Taha/reviews-filtered-labels"
+citation_author = "Taha, Abdullah"
+citation_year = 2026
 card_template = "card_template.md"
 queries = []

@@ -50,6 +50,11 @@ max_model_len = 40000
 max_num_seqs = 15
 
 [publish]
-repo_id = "Abdullah-Taha/products-filtered-llm-labels"
+title = "Semantic Filter Labels for SemCEB Products"
+repo_id = "Abdullah-Taha/products-filtered-labels"
+citation_author = "Taha, Abdullah"
+citation_year = 2026
 card_template = "card_template.md"
 queries = []
+# repo_id = "your-org/semceb-products-filter-labels"
+
